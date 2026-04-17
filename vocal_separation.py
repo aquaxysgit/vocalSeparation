@@ -14,6 +14,10 @@ import soundfile as sf
 from spleeter.separator import Separator
 
 
+# Module-level constant for model path
+MODEL_PATH = 'spleeter:2stems'
+
+
 def load_audio(filepath: str, duration: float = 60.0):
     """
     Load audio file using librosa.
@@ -58,7 +62,7 @@ def save_audio(filepath: str, y: np.ndarray, sr: int):
     sf.write(filepath, y, sr)
 
 
-def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: str):
+def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: str, duration: float = 60.0):
     """
     Separate vocals and accompaniment from an audio file using Spleeter.
 
@@ -79,24 +83,33 @@ def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: st
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     # Initialize Spleeter separator with 2-stems model
-    separator = Separator('spleeter:2stems')
+    separator = Separator(MODEL_PATH)
 
-    # Load audio with librosa
-    y, sr = load_audio(input_path)
+    # Load audio with librosa (pass duration parameter)
+    y, sr = load_audio(input_path, duration=duration)
 
     # Convert mono to stereo if needed (Spleeter expects stereo input)
+    # Reshape mono to have 2 channels
     if len(y.shape) == 1:
+        # Mono: y is (n,) -> stack to get (n, 2)
         y = np.stack([y, y], axis=1)
     elif len(y.shape) == 2:
-        # Ensure we have 2 channels
+        # Already multi-channel, ensure we have exactly 2 channels
         if y.shape[1] == 1:
+            # Single channel -> duplicate to get stereo
             y = np.concatenate([y, y], axis=1)
         elif y.shape[1] != 2:
-            # Take first 2 channels if more than 2
+            # More than 2 channels -> take first 2
             y = y[:, :2]
 
     # Perform separation
     result = separator.separate(y, sr)
+
+    # Validate output dictionary keys before accessing
+    if 'vocals' not in result:
+        raise ValueError("Model output missing 'vocals' key")
+    if 'accompaniment' not in result:
+        raise ValueError("Model output missing 'accompaniment' key")
 
     # Extract vocal and accompaniment
     vocal = result['vocals']
@@ -141,7 +154,8 @@ def main():
         vocal, accompaniment, sr = separate_vocals(
             args.input,
             args.vocal,
-            args.accompaniment
+            args.accompaniment,
+            duration=args.duration
         )
         print(f"Successfully separated vocals and accompaniment!")
         print(f"  Input: {args.input}")
