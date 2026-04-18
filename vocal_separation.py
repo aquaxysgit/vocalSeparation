@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
 """
-Vocal separation module using Spleeter for audio source separation.
+Vocal separation module using Demucs for audio source separation.
 Separates vocals from background music in WAV/MP3 files.
+
+Requires: torch, torchaudio, demucs
+GPU推荐: CUDA 12.1+ (RTX 3080 Ti 등)
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
-from spleeter.separator import Separator
+import demucs
+from demucs.apply import apply_model
+from demucs.hdemucs import HDemucs
+from demucs.utils import dispatch
+import torch
 
 
-# Module-level constant for model path
-MODEL_PATH = 'spleeter:2stems'
+# Module-level constant for model name
+MODEL_NAME = 'htdemucs'
 
 
-def load_audio(filepath: str, duration: float = 60.0):
+def load_audio(filepath: str):
     """
-    Load audio file using librosa.
+    Load audio file using soundfile.
 
     Args:
         filepath: Path to the audio file (WAV or MP3)
-        duration: Maximum duration to load in seconds
 
     Returns:
-        Tuple of (audio_timeseries, sample_rate)
+        Tuple of (audio_tensor, sample_rate) where audio_tensor is (channels, time)
 
     Raises:
         FileNotFoundError: If the audio file doesn't exist
@@ -43,28 +48,35 @@ def load_audio(filepath: str, duration: float = 60.0):
                          f"Supported formats: {supported_extensions}")
 
     try:
-        y, sr = librosa.load(filepath, sr=None, duration=duration)
-        return y, sr
+        y, sr = sf.read(filepath, dtype='float32')
+        # Convert to (channels, time) format
+        if y.ndim == 1:
+            y = y[np.newaxis, :]
+        else:
+            y = y.T
+        return torch.from_numpy(y), sr
     except Exception as e:
         raise ValueError(f"Error loading audio file: {e}")
 
 
-def save_audio(filepath: str, y: np.ndarray, sr: int):
+def save_audio(filepath: str, y: torch.Tensor, sr: int):
     """
     Save audio file using soundfile.
 
     Args:
         filepath: Output file path
-        y: Audio timeseries array
+        y: Audio tensor (channels, time)
         sr: Sample rate
     """
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-    sf.write(filepath, y, sr)
+    # Convert from (channels, time) to (time, channels) for soundfile
+    y_np = y.numpy().T
+    sf.write(filepath, y_np, sr)
 
 
-def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: str, duration: float = 60.0):
+def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: str):
     """
-    Separate vocals and accompaniment from an audio file using Spleeter.
+    Separate vocals and accompaniment from an audio file using Demucs.
 
     Args:
         input_path: Path to the input audio file (WAV or MP3)
@@ -72,7 +84,7 @@ def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: st
         output_accompaniment: Path to save the accompaniment
 
     Returns:
-        Tuple of (vocal_timeseries, accompaniment_timeseries, sample_rate)
+        Tuple of (vocal_tensor, accompaniment_tensor, sample_rate)
 
     Raises:
         FileNotFoundError: If the input file doesn't exist
@@ -82,50 +94,43 @@ def separate_vocals(input_path: str, output_vocal: str, output_accompaniment: st
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    # Initialize Spleeter separator with 2-stems model
-    separator = Separator(MODEL_PATH)
+    # Load audio
+    audio, sr = load_audio(input_path)
 
-    # Load audio with librosa (pass duration parameter)
-    y, sr = load_audio(input_path, duration=duration)
+    # Load Demucs model
+    model = HDemucs()
+    model.load_state_dict(torch.hub.load_state_dict_from_url(
+        demucs.__pretrained__.get(MODEL_NAME, demucs.__pretrained__[MODEL_NAME]),
+        map_location='cpu'
+    ))
+    model.eval()
 
-    # Convert mono to stereo if needed (Spleeter expects stereo input)
-    # Reshape mono to have 2 channels
-    if len(y.shape) == 1:
-        # Mono: y is (n,) -> stack to get (n, 2)
-        y = np.stack([y, y], axis=1)
-    elif len(y.shape) == 2:
-        # Already multi-channel, ensure we have exactly 2 channels
-        if y.shape[1] == 1:
-            # Single channel -> duplicate to get stereo
-            y = np.concatenate([y, y], axis=1)
-        elif y.shape[1] != 2:
-            # More than 2 channels -> take first 2
-            y = y[:, :2]
+    # Dispatch to GPU if available
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device)
+    audio = audio.to(device)
 
-    # Perform separation
-    result = separator.separate(y, sr)
+    # Apply separation
+    with torch.no_grad():
+        separated = apply_model(model, audio[None, ...])[0]
 
-    # Validate output dictionary keys before accessing
-    if 'vocals' not in result:
-        raise ValueError("Model output missing 'vocals' key")
-    if 'accompaniment' not in result:
-        raise ValueError("Model output missing 'accompaniment' key")
+    # Get vocals (first channel)
+    vocal = separated[0]
 
-    # Extract vocal and accompaniment
-    vocal = result['vocals']
-    accompaniment = result['accompaniment']
+    # Get accompaniment (sum of remaining stems)
+    accompaniment = separated[1:].sum(dim=0)
 
-    # Save separated audio
-    save_audio(output_vocal, vocal, sr)
-    save_audio(output_accompaniment, accompaniment, sr)
+    # Save outputs
+    save_audio(output_vocal, vocal.cpu(), sr)
+    save_audio(output_accompaniment, accompaniment.cpu(), sr)
 
-    return vocal, accompaniment, sr
+    return vocal.cpu(), accompaniment.cpu(), sr
 
 
 def main():
     """CLI entry point for vocal separation."""
     parser = argparse.ArgumentParser(
-        description='Separate vocals from background music in audio files.'
+        description='Separate vocals from background music in audio files using Demucs.'
     )
     parser.add_argument(
         'input',
@@ -141,12 +146,6 @@ def main():
         required=True,
         help='Output path for accompaniment'
     )
-    parser.add_argument(
-        '-d', '--duration',
-        type=float,
-        default=60.0,
-        help='Maximum duration to process in seconds (default: 60.0)'
-    )
 
     args = parser.parse_args()
 
@@ -154,8 +153,7 @@ def main():
         vocal, accompaniment, sr = separate_vocals(
             args.input,
             args.vocal,
-            args.accompaniment,
-            duration=args.duration
+            args.accompaniment
         )
         print(f"Successfully separated vocals and accompaniment!")
         print(f"  Input: {args.input}")
